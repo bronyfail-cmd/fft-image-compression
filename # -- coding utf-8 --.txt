@@ -1,0 +1,389 @@
+# -*- coding: utf-8 -*-
+"""
+Фазовая корреляция для выравнивания изображений (сдвиг, поворот, масштаб).
+Всё в одном файле — никаких импортов между собственными модулями,
+можно вставить целиком в одну ячейку Jupyter/Colab.
+
+Этапы:
+  1. Сдвиг (translation)      -> классическая фазовая корреляция
+  2. Поворот + масштаб        -> метод Рэдди-Чаттерджи (Reddy-Chatterji, 1996):
+       логарифм амплитудного спектра -> логполярные координаты ->
+       поворот/масштаб превращаются в сдвиг по двум осям ->
+       снова фазовая корреляция.
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.fft import fft2, ifft2, fftshift
+from scipy.ndimage import shift as nd_shift, rotate as nd_rotate, zoom as nd_zoom
+from skimage import data, img_as_float
+from skimage.transform import warp_polar, resize
+
+np.random.seed(0)
+
+
+# ========================================================================
+# 1. БАЗОВАЯ ФАЗОВАЯ КОРРЕЛЯЦИЯ (сдвиг по X, Y)
+# ========================================================================
+
+def hann_window(shape):
+    """2D-окно Хана — убирает скачок яркости на краях кадра.
+    Без него FFT 'видит' резкий край изображения как высокочастотный
+    сигнал, который зашумляет пик корреляции."""
+    wy = np.hanning(shape[0])
+    wx = np.hanning(shape[1])
+    return np.outer(wy, wx)
+
+
+def parabolic_subpixel(surface, py, px):
+    """
+    Субпиксельная интерполяция пика через параболу по трём точкам
+    вдоль каждой оси отдельно:
+        offset = 0.5 * (f(-1) - f(+1)) / (f(-1) - 2*f(0) + f(+1))
+    """
+    h, w = surface.shape
+
+    def refine_1d(f_m1, f_0, f_p1):
+        denom = (f_m1 - 2 * f_0 + f_p1)
+        if abs(denom) < 1e-9:
+            return 0.0
+        return 0.5 * (f_m1 - f_p1) / denom
+
+    sub_y = float(py)
+    sub_x = float(px)
+
+    if 0 < py < h - 1:
+        sub_y = py + refine_1d(surface[py - 1, px], surface[py, px], surface[py + 1, px])
+    if 0 < px < w - 1:
+        sub_x = px + refine_1d(surface[py, px - 1], surface[py, px], surface[py, px + 1])
+
+    return sub_y, sub_x
+
+
+def phase_correlation(img1, img2, apply_window=True):
+    """
+    Находит сдвиг (dy, dx), на который img2 смещено относительно img1.
+
+    Возвращает:
+        shift (dy, dx)      — субпиксельная оценка
+        corr_surface        — поверхность взаимной корреляции (для визуализации)
+        peak_value          — высота пика (мера уверенности, 0..1)
+    """
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+
+    if apply_window:
+        win = hann_window(img1.shape)
+        img1 = img1 * win
+        img2 = img2 * win
+
+    F1 = fft2(img1)
+    F2 = fft2(img2)
+
+    # Взаимный спектр и его фазовая часть (нормировка на модуль).
+    # Именно это убирает информацию об амплитуде - остаётся только фаза,
+    # которая и кодирует сдвиг (теорема о сдвиге Фурье).
+    # Конвенция F2*conj(F1) даёт пик в точке (dy, dx), на которую img2
+    # сдвинуто относительно img1.
+    cross_power = F2 * np.conj(F1)
+    eps = 1e-12
+    R = cross_power / (np.abs(cross_power) + eps)
+
+    corr = np.real(ifft2(R))
+    corr_shifted = fftshift(corr)
+
+    peak_y, peak_x = np.unravel_index(np.argmax(corr_shifted), corr_shifted.shape)
+    peak_value = corr_shifted[peak_y, peak_x]
+
+    sub_y, sub_x = parabolic_subpixel(corr_shifted, peak_y, peak_x)
+
+    cy, cx = np.array(img1.shape) // 2
+    dy = sub_y - cy
+    dx = sub_x - cx
+
+    return (dy, dx), corr_shifted, peak_value
+
+
+# ========================================================================
+# 2. ПОВОРОТ + МАСШТАБ: метод Рэдди-Чаттерджи
+# ========================================================================
+#
+# Идея: амплитудные спектры |F1|, |F2| двух изображений, связанных
+# поворотом и масштабом, связаны тем же поворотом и обратным масштабом
+# (сдвиг исходных картинок не влияет на |F| — удобно, избавляемся от
+# него на этом шаге автоматически).
+#
+# Переходим в лог-полярные координаты (угол, log(радиус)):
+#   поворот изображения  -> сдвиг по оси "угол"
+#   масштаб изображения  -> сдвиг по оси "log(радиус)"
+# Дальше это снова задача "найти сдвиг" -> обычная фазовая корреляция.
+
+def log_polar_spectrum(img):
+    """Лог-полярное представление log(1+|F|) — амплитудного спектра Фурье."""
+    img = img.astype(np.float64)
+    win = hann_window(img.shape)
+    img_w = img * win
+
+    F = fftshift(fft2(img_w))
+    magnitude = np.abs(F)
+    log_magnitude = np.log1p(magnitude)
+
+    h, w = log_magnitude.shape
+    radius = min(h, w) // 2
+
+    lp = warp_polar(log_magnitude, radius=radius, scaling='log', output_shape=(360, radius))
+    return lp
+
+
+def estimate_rotation_scale(img1, img2):
+    """
+    Оценивает угол поворота (град.) и коэффициент масштаба,
+    связывающий img1 и img2, через фазовую корреляцию их
+    лог-полярных амплитудных спектров.
+    """
+    lp1 = log_polar_spectrum(img1)
+    lp2 = log_polar_spectrum(img2)
+
+    (d_angle_row, d_logr_col), corr, peak = phase_correlation(lp1, lp2, apply_window=True)
+
+    n_angle_rows = lp1.shape[0]
+    n_radius_cols = lp1.shape[1]
+
+    angle_deg = -d_angle_row * (360.0 / n_angle_rows)
+
+    # warp_polar с scaling='log': radius(col) = radius_max ** (col / n_radius_cols)
+    radius_max = min(img1.shape) // 2
+    log_radius_max = np.log(radius_max)
+    log_r_step = log_radius_max / n_radius_cols
+    scale = np.exp(-d_logr_col * log_r_step)
+
+    return angle_deg, scale, peak
+
+
+def disambiguate_angle(angle_deg):
+    """Амплитудный спектр симметричен: поворот на a и a+180 дают
+    одинаковый лог-полярный спектр. Возвращаем оба кандидата."""
+    a1 = angle_deg
+    a2 = angle_deg + 180.0
+    a1 = ((a1 + 180) % 360) - 180
+    a2 = ((a2 + 180) % 360) - 180
+    return a1, a2
+
+
+def correlation_score(img1, img2):
+    """Корреляция Пирсона между двумя изображениями одного размера —
+    используется для выбора угла среди кандидатов (0/180) и для оценки
+    итогового качества совмещения."""
+    a = img1.astype(np.float64)
+    b = img2.astype(np.float64)
+    a = (a - a.mean()) / (a.std() + 1e-9)
+    b = (b - b.mean()) / (b.std() + 1e-9)
+    return float(np.mean(a * b))
+
+
+# ========================================================================
+# Вспомогательные геометрические функции для построения тестовых пар
+# ========================================================================
+
+def crop_or_pad_around(img, target_shape, center_yx):
+    """Вырезает/дополняет img до target_shape так, что точка center_yx
+    исходного img оказывается в центре результата."""
+    th, tw = target_shape
+    cy, cx = center_yx
+
+    pad = int(np.ceil(max(th, tw))) + 2
+    img_p = np.pad(img, pad, mode='reflect')
+    cy_p, cx_p = cy + pad, cx + pad
+
+    y0 = int(round(cy_p - th / 2))
+    x0 = int(round(cx_p - tw / 2))
+    return img_p[y0:y0 + th, x0:x0 + tw]
+
+
+def zoom_about_center(img, scale, target_shape=None):
+    """
+    scipy.ndimage.zoom масштабирует относительно угла (0,0), а не центра:
+    точка (y,x) переходит в (y*scale, x*scale). Эта функция масштабирует
+    и вырезает окно так, чтобы центр исходной картинки остался в центре
+    результата.
+    """
+    if target_shape is None:
+        target_shape = img.shape
+
+    h, w = img.shape
+    out = nd_zoom(img, scale, order=3, mode='reflect')
+
+    new_center = (h / 2 * scale, w / 2 * scale)
+    return crop_or_pad_around(out, target_shape, new_center)
+
+
+def make_base_image(size=256):
+    img = img_as_float(data.camera())  # 512x512, grayscale
+    img = resize(img, (size, size), anti_aliasing=True)
+    return img
+
+
+def apply_transform(img, dy, dx, angle_deg, scale):
+    """
+    Применяет: сдвиг -> поворот -> масштаб.
+    Сдвиг применяется ПЕРВЫМ, в координатах исходного эталонного
+    изображения - так "истинный сдвиг" однозначен и не путается
+    с поворотом/масштабом системы координат.
+    """
+    out = nd_shift(img, shift=(dy, dx), order=3, mode='reflect')
+    out = nd_rotate(out, angle_deg, reshape=False, order=3, mode='reflect')
+    out = zoom_about_center(out, scale, img.shape)
+    return out
+
+
+# ========================================================================
+# ЧАСТЬ A — ЧИСТЫЙ СДВИГ
+# ========================================================================
+
+print("=" * 70)
+print("ЧАСТЬ A: чистый сдвиг (translation)")
+print("=" * 70)
+
+img_ref = make_base_image(256)
+
+true_dy, true_dx = 13.7, -22.3   # известный сдвиг (с дробной частью - тест субпикселя)
+img_shifted = nd_shift(img_ref, shift=(true_dy, true_dx), order=3, mode='reflect')
+
+(est_dy, est_dx), corr_surface, peak_val = phase_correlation(img_ref, img_shifted)
+
+print(f"Истинный сдвиг:     dy={true_dy:.2f}, dx={true_dx:.2f}")
+print(f"Найденный сдвиг:    dy={est_dy:.2f}, dx={est_dx:.2f}")
+print(f"Ошибка:             dy={abs(est_dy-true_dy):.3f}, dx={abs(est_dx-true_dx):.3f} px")
+print(f"Высота пика корреляции (уверенность): {peak_val:.3f}")
+
+fig, axes = plt.subplots(2, 2, figsize=(11, 11))
+
+axes[0, 0].imshow(img_ref, cmap='gray')
+axes[0, 0].set_title('Эталон (reference)')
+axes[0, 0].axis('off')
+
+axes[0, 1].imshow(img_shifted, cmap='gray')
+axes[0, 1].set_title(f'Смещённое\n(истинно: dy={true_dy:.1f}, dx={true_dx:.1f})')
+axes[0, 1].axis('off')
+
+h, w = corr_surface.shape
+cy, cx = h // 2, w // 2
+zoom_r = 40
+y0, y1 = max(cy - zoom_r, 0), min(cy + zoom_r, h)
+x0, x1 = max(cx - zoom_r, 0), min(cx + zoom_r, w)
+
+im = axes[1, 0].imshow(corr_surface, cmap='inferno')
+axes[1, 0].plot(cx + est_dx, cy + est_dy, 'c+', markersize=20, markeredgewidth=2)
+axes[1, 0].set_title('Поверхность фазовой корреляции\n(полная)')
+axes[1, 0].axis('off')
+plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+
+im2 = axes[1, 1].imshow(corr_surface[y0:y1, x0:x1], cmap='inferno', extent=[x0, x1, y1, y0])
+axes[1, 1].plot(cx + est_dx, cy + est_dy, 'c+', markersize=20, markeredgewidth=2,
+                label=f'Пик: dy={est_dy:.2f}, dx={est_dx:.2f}')
+axes[1, 1].set_title('Пик корреляции (увеличено)')
+axes[1, 1].legend(loc='upper right', fontsize=9)
+axes[1, 1].axis('off')
+
+plt.tight_layout()
+plt.savefig('part_A_shift.png', dpi=130)
+plt.show()
+print("Сохранено: part_A_shift.png\n")
+
+
+# ========================================================================
+# ЧАСТЬ B — СДВИГ + ПОВОРОТ + МАСШТАБ
+# ========================================================================
+
+print("=" * 70)
+print("ЧАСТЬ B: сдвиг + поворот + масштаб (Reddy-Chatterji)")
+print("=" * 70)
+
+true_angle = 27.0     # градусы
+true_scale = 1.18     # коэффициент увеличения
+true_dy2, true_dx2 = 8.0, -15.0
+
+img_transformed = apply_transform(img_ref, true_dy2, true_dx2, true_angle, true_scale)
+
+# Шаг 1: угол и масштаб через лог-полярные амплитудные спектры
+raw_angle, est_scale, lp_peak = estimate_rotation_scale(img_ref, img_transformed)
+angle_candidates = disambiguate_angle(raw_angle)
+
+# Шаг 2: разрешаем неоднозначность 0/180 - пробуем оба угла,
+# компенсируем поворот+масштаб и смотрим, какой вариант даёт лучшую
+# корреляцию после нахождения остаточного сдвига.
+# Прямое преобразование было: shift -> rotate(angle) -> zoom(scale)
+# Обратное: zoom(1/scale) -> rotate(-angle) -> [чистый сдвиг (dy,dx)
+# в координатах img_ref, который найдёт phase_correlation]
+best = None
+for cand_angle in angle_candidates:
+    compensated = zoom_about_center(img_transformed, 1.0 / est_scale, img_ref.shape)
+    compensated = nd_rotate(compensated, -cand_angle, reshape=False, order=3, mode='reflect')
+
+    (dy_c, dx_c), _, peak_c = phase_correlation(img_ref, compensated)
+    score = correlation_score(img_ref, nd_shift(compensated, shift=(dy_c, dx_c), order=3, mode='reflect'))
+
+    if best is None or score > best['score']:
+        best = dict(angle=cand_angle, scale=est_scale, dy=dy_c, dx=dx_c,
+                    compensated=compensated, score=score, peak=peak_c)
+
+print(f"Истинный угол поворота:   {true_angle:.2f} град.")
+print(f"Найденный угол поворота:  {best['angle']:.2f} град.  (ошибка {abs(best['angle']-true_angle):.2f} град.)")
+print(f"Истинный масштаб:         {true_scale:.3f}")
+print(f"Найденный масштаб:        {best['scale']:.3f}  (ошибка {abs(best['scale']-true_scale):.3f})")
+print(f"Истинный сдвиг:           dy={true_dy2:.2f}, dx={true_dx2:.2f}")
+print(f"Найденный сдвиг:          dy={best['dy']:.2f}, dx={best['dx']:.2f}")
+print(f"Качество совмещения (корр. Пирсона после компенсации): {best['score']:.3f}")
+
+fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+axes[0, 0].imshow(img_ref, cmap='gray')
+axes[0, 0].set_title('Эталон')
+axes[0, 0].axis('off')
+
+axes[0, 1].imshow(img_transformed, cmap='gray')
+axes[0, 1].set_title(f'Трансформировано\n(поворот={true_angle:.0f}°, масштаб={true_scale:.2f}, сдвиг)')
+axes[0, 1].axis('off')
+
+final_aligned = nd_shift(best['compensated'], shift=(best['dy'], best['dx']), order=3, mode='reflect')
+axes[0, 2].imshow(final_aligned, cmap='gray')
+axes[0, 2].set_title('После компенсации\n(поворот+масштаб+сдвиг)')
+axes[0, 2].axis('off')
+
+lp1 = log_polar_spectrum(img_ref)
+lp2 = log_polar_spectrum(img_transformed)
+
+axes[1, 0].imshow(lp1, cmap='magma', aspect='auto')
+axes[1, 0].set_title('Лог-полярный спектр\n(эталон)\nось Y = угол, ось X = log(радиус)')
+axes[1, 0].set_xlabel('log(радиус)')
+axes[1, 0].set_ylabel('угол (°)')
+
+axes[1, 1].imshow(lp2, cmap='magma', aspect='auto')
+axes[1, 1].set_title('Лог-полярный спектр\n(трансформировано)')
+axes[1, 1].set_xlabel('log(радиус)')
+axes[1, 1].set_ylabel('угол (°)')
+
+diff = np.abs(img_ref - final_aligned)
+im_d = axes[1, 2].imshow(diff, cmap='hot')
+axes[1, 2].set_title(f'Карта ошибки после выравнивания\n(корр.={best["score"]:.3f})')
+axes[1, 2].axis('off')
+plt.colorbar(im_d, ax=axes[1, 2], fraction=0.046)
+
+plt.tight_layout()
+plt.savefig('part_B_rotation_scale.png', dpi=130)
+plt.show()
+print("Сохранено: part_B_rotation_scale.png")
+
+# ========================================================================
+# Сводная таблица результатов
+# ========================================================================
+print("\n" + "=" * 70)
+print("ИТОГОВАЯ СВОДКА")
+print("=" * 70)
+print(f"{'Параметр':<25}{'Истина':>15}{'Найдено':>15}{'Ошибка':>15}")
+print(f"{'Сдвиг dy (A)':<25}{true_dy:>15.3f}{est_dy:>15.3f}{abs(est_dy-true_dy):>15.4f}")
+print(f"{'Сдвиг dx (A)':<25}{true_dx:>15.3f}{est_dx:>15.3f}{abs(est_dx-true_dx):>15.4f}")
+print(f"{'Угол поворота (B)':<25}{true_angle:>15.3f}{best['angle']:>15.3f}{abs(best['angle']-true_angle):>15.4f}")
+print(f"{'Масштаб (B)':<25}{true_scale:>15.3f}{best['scale']:>15.3f}{abs(best['scale']-true_scale):>15.4f}")
+print(f"{'Сдвиг dy (B)':<25}{true_dy2:>15.3f}{best['dy']:>15.3f}{abs(best['dy']-true_dy2):>15.4f}")
+print(f"{'Сдвиг dx (B)':<25}{true_dx2:>15.3f}{best['dx']:>15.3f}{abs(best['dx']-true_dx2):>15.4f}")
