@@ -1,17 +1,24 @@
 # -*- coding: utf-8 -*-
 """
 Задание 17 - Бабенко
-Сжатие изображения с помощью усечения спектра (2D БПФ)
+Сжатие изображения с помощью усечения спектра
 
-Алгоритм:
+Реализовать алгоритм сжатия, основанный на сохранении только определённого
+процента самых больших коэффициентов Фурье-спектра.
+
+Что нужно сделать (по тексту задания):
 1. Вычислить двумерное БПФ изображения.
 2. Отсортировать амплитуды всех частотных коэффициентов по убыванию.
-3. Оставить только N% коэффициентов с наибольшей амплитудой, остальные обнулить.
-4. Выполнить обратное БПФ -> восстановленное изображение.
-5. Оценить качество через PSNR/MSE, построить график PSNR(N%).
+3. Оставить только N% (например, 10%, 5%, 1%) коэффициентов с наибольшей
+   амплитудой, остальные обнулить.
+4. Выполнить обратное БПФ и получить восстановленное изображение.
+5. Оценить качество сжатия: визуально и через PSNR (пиковое отношение
+   сигнал/шум) или MSE. Построить график зависимости PSNR от процента
+   оставленных коэффициентов.
 
-Дополнительно: сохранение сжатого изображения как списка индексов и значений
-оставшихся коэффициентов + последующая загрузка и восстановление.
+Дополнительно: реализовать сохранение сжатого изображения в виде списка
+индексов и значений оставшихся коэффициентов, а затем загрузку и
+восстановление.
 """
 
 import numpy as np
@@ -69,7 +76,10 @@ def generate_test_image(size=256):
     return img
 
 
-IMG_PATH = "/home/claude/test_image.png"
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+IMG_PATH = os.path.join(RESULTS_DIR, "test_image.png")
 image = generate_test_image(256)
 Image.fromarray(image).save(IMG_PATH)
 print(f"Тестовое изображение сгенерировано: {image.shape}, сохранено в {IMG_PATH}")
@@ -85,7 +95,7 @@ print(f"Тестовое изображение сгенерировано: {ima
 def compress_by_spectrum_truncation(img, percent):
     """
     Сжимает изображение, оставляя только percent% коэффициентов Фурье
-    с наибольшей амплитудой.
+    с наибольшей амплитудой. Функция построена строго по шагам задания.
 
     Параметры
     ---------
@@ -95,36 +105,38 @@ def compress_by_spectrum_truncation(img, percent):
     Возвращает
     ----------
     reconstructed : 2D ndarray (uint8) - восстановленное изображение
-    fft_truncated : 2D ndarray (complex) - усечённый спектр (для отладки/доп. задания)
+    F_truncated   : 2D ndarray (complex) - усечённый спектр
+    mask          : 2D ndarray (bool) - маска оставленных коэффициентов
     """
     img_f = img.astype(np.float64)
+    n_rows, n_cols = img_f.shape
 
-    # 1. Двумерное БПФ
+    # --- Шаг 1: Вычислить двумерное БПФ изображения ---
     F = np.fft.fft2(img_f)
 
-    # 2. Сортировка амплитуд по убыванию (работаем с "сплющенным" массивом)
-    magnitude = np.abs(F)
-    flat_mag = magnitude.flatten()
-    # Индексы, которые отсортировали бы amplitude по убыванию.
-    # Используем argsort по возрастанию и берём порог через kth-элемент - быстрее для больших N.
-    n_total = flat_mag.size
-    n_keep = max(1, int(np.round(n_total * percent / 100.0)))
+    # --- Шаг 2: Отсортировать амплитуды всех частотных коэффициентов по убыванию ---
+    magnitude = np.abs(F)                      # амплитуда каждого коэффициента
+    flat_magnitude = magnitude.flatten()        # превращаем 2D-матрицу в 1D-список
+    sorted_indices = np.argsort(flat_magnitude)[::-1]
+    # sorted_indices[0] - индекс коэффициента с самой большой амплитудой,
+    # sorted_indices[1] - со следующей по величине, и так далее (по убыванию).
 
-    # Порог амплитуды: n_keep-й по величине элемент (быстрее, чем полная сортировка)
-    threshold_idx = n_total - n_keep
-    partitioned = np.partition(flat_mag, threshold_idx)
-    threshold_value = partitioned[threshold_idx]
+    # --- Шаг 3: Оставить только N% коэффициентов с наибольшей амплитудой,
+    #            остальные обнулить ---
+    n_total = flat_magnitude.size
+    n_keep = max(1, int(round(n_total * percent / 100.0)))
 
-    # 3. Маска: оставляем коэффициенты с амплитудой >= порога, остальные - 0
-    mask = magnitude >= threshold_value
-    # На случай, если из-за повторяющихся значений порога коэффициентов чуть больше n_keep -
-    # это не страшно, поведение детерминировано и стандартно для таких задач.
+    indices_to_keep = sorted_indices[:n_keep]   # top-N% индексов после сортировки
 
-    F_truncated = F * mask
+    mask_flat = np.zeros(n_total, dtype=bool)
+    mask_flat[indices_to_keep] = True
+    mask = mask_flat.reshape(n_rows, n_cols)
 
-    # 4. Обратное БПФ
+    F_truncated = F * mask                      # все "слабые" коэффициенты -> 0
+
+    # --- Шаг 4: Выполнить обратное БПФ и получить восстановленное изображение ---
     img_reconstructed = np.fft.ifft2(F_truncated)
-    img_reconstructed = np.real(img_reconstructed)
+    img_reconstructed = np.real(img_reconstructed)  # мнимая часть ~0 (погрешность вычислений)
     img_reconstructed = np.clip(img_reconstructed, 0, 255).astype(np.uint8)
 
     return img_reconstructed, F_truncated, mask
@@ -148,7 +160,8 @@ def compute_psnr(original, reconstructed, max_pixel=255.0):
 
 
 # ---------------------------------------------------------------------------
-# Демонстрация для нескольких процентов (10%, 5%, 1% + пара дополнительных)
+# Демонстрация для N%, указанных в задании как пример: 10%, 5%, 1%
+# (плюс 50% для наглядного сравнения с малым искажением)
 # ---------------------------------------------------------------------------
 
 percents_to_show = [50, 10, 5, 1]
@@ -174,7 +187,7 @@ for ax, p in zip(axes[1:], percents_to_show):
     ax.axis('off')
 
 plt.tight_layout()
-plt.savefig("/home/claude/comparison.png", dpi=120)
+plt.savefig(os.path.join(RESULTS_DIR, "comparison.png"), dpi=120)
 plt.close()
 print("Сохранено сравнение изображений: comparison.png")
 
@@ -207,7 +220,7 @@ ax2.set_title("Зависимость MSE от N%")
 ax2.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig("/home/claude/psnr_vs_percent.png", dpi=120)
+plt.savefig(os.path.join(RESULTS_DIR, "psnr_vs_percent.png"), dpi=120)
 plt.close()
 print("Сохранён график PSNR(N%) и MSE(N%): psnr_vs_percent.png")
 
@@ -267,7 +280,7 @@ def load_and_reconstruct(filepath):
 demo_percent = 10
 rec_demo, F_trunc_demo, mask_demo = compress_by_spectrum_truncation(image, demo_percent)
 
-COMPRESSED_PATH = "/home/claude/compressed_data.pkl"
+COMPRESSED_PATH = os.path.join(RESULTS_DIR, "compressed_data.pkl")
 full_bytes, sparse_bytes = save_compressed(F_trunc_demo, mask_demo, image.shape, COMPRESSED_PATH)
 
 print(f"\n--- Дополнительное задание (N={demo_percent}%) ---")
