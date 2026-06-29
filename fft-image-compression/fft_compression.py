@@ -76,7 +76,7 @@ def generate_test_image(size=256):
     return img
 
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+RESULTS_DIR = os.path.join(os.getcwd(), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 IMG_PATH = os.path.join(RESULTS_DIR, "test_image.png")
@@ -298,3 +298,7 @@ psnr_loaded = compute_psnr(image, img_loaded)
 print(f"PSNR восстановленного из файла изображения: {psnr_loaded:.2f} дБ")
 
 print("\nВсе файлы готовы: test_image.png, comparison.png, psnr_vs_percent.png, compressed_data.pkl")
+from IPython.display import Image, display
+
+display(Image(os.path.join(RESULTS_DIR, "comparison.png")))
+display(Image(os.path.join(RESULTS_DIR, "psnr_vs_percent.png")))
